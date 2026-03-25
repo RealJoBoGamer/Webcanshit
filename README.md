@@ -8,12 +8,25 @@ A Linux program that automatically streams a USB webcam feed over HTTP.
 2. **Detects USB cameras** — scans `/dev/video*` for connected webcams
 3. **Checks for updates** — compares against this GitHub repository for new versions
 4. **Streams via HTTP** — starts an MJPEG streaming server accessible on the network
+5. **Public internet access** — automatically exposes the stream to the internet via UPnP or SSH tunnel so anyone can view it without being on the same WiFi
+
+## How Public Access Works
+
+The server tries these methods in order to make your stream accessible from anywhere:
+
+1. **UPnP port forwarding** — asks your router to forward the port directly (fastest, requires `miniupnpc`)
+2. **SSH tunnel via localhost.run** — creates a free reverse tunnel, gives you a public URL (no signup needed)
+3. **SSH tunnel via serveo.net** — fallback tunnel service
+
+You get a shareable public URL in the console output. Set `TUNNEL_MODE=none` to disable.
 
 ## Requirements
 
 - Linux with Python 3.6+
 - `ffmpeg` — video capture and encoding
 - `v4l-utils` — camera detection (optional but recommended)
+- `openssh-client` — for SSH tunnel (recommended)
+- `miniupnpc` — for UPnP port forwarding (optional)
 - A USB webcam
 
 ## Quick Start
@@ -52,6 +65,7 @@ Set via environment variables:
 | `RESOLUTION`    | `640x480`   | Capture resolution             |
 | `FRAMERATE`     | `30`        | Frames per second              |
 | `WIFI_TIMEOUT`  | `120`       | Seconds to wait for WiFi       |
+| `TUNNEL_MODE`   | `auto`      | `auto`, `upnp`, `ssh`, or `none` |
 
 Example:
 ```bash

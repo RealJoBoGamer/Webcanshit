@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import os
+import re
 import signal
 import threading
 import json
@@ -26,7 +27,7 @@ from socketserver import ThreadingMixIn
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 GITHUB_REPO = "RealJoBoGamer/Webcanshit"
 STREAM_PORT = int(os.environ.get("STREAM_PORT", 8080))
 CAMERA_DEVICE = os.environ.get("CAMERA_DEVICE", "")  # auto-detect if empty
@@ -34,6 +35,7 @@ RESOLUTION = os.environ.get("RESOLUTION", "640x480")
 FRAMERATE = int(os.environ.get("FRAMERATE", 30))
 WIFI_TIMEOUT = int(os.environ.get("WIFI_TIMEOUT", 120))  # seconds
 WIFI_CHECK_INTERVAL = 2  # seconds
+TUNNEL_MODE = os.environ.get("TUNNEL_MODE", "auto")  # auto, upnp, ssh, none
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -236,7 +238,194 @@ def check_for_updates():
         log(f"Update check failed: {e} (continuing anyway)")
 
 # ---------------------------------------------------------------------------
-# 4. MJPEG Streaming Server
+# 4. Public Internet Access (Tunnel / UPnP)
+# ---------------------------------------------------------------------------
+
+# Global: holds the public URL once a tunnel is established
+public_url = None
+tunnel_process = None
+
+def get_external_ip():
+    """Query external IP from public services."""
+    for url in ["https://ifconfig.me", "https://api.ipify.org", "https://icanhazip.com"]:
+        try:
+            result = subprocess.run(
+                ["curl", "-sf", "--connect-timeout", "5", "--max-time", "8", url],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                ip = result.stdout.strip()
+                if re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
+                    return ip
+        except Exception:
+            continue
+    return None
+
+def try_upnp_forward(port):
+    """Try to set up UPnP port forwarding on the router. Returns external IP or None."""
+    try:
+        # Check if upnpc (miniupnpc) is available
+        subprocess.run(["upnpc", "-h"], capture_output=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        log("  UPnP: 'upnpc' not installed (install miniupnpc to enable)")
+        return None
+
+    try:
+        local_ip = get_public_ip()
+        # Add port mapping: external port -> local ip:port (TCP, lease 0 = permanent until removed)
+        result = subprocess.run(
+            ["upnpc", "-a", local_ip, str(port), str(port), "TCP", "86400"],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0 or "is redirected to" in result.stdout:
+            ext_ip = get_external_ip()
+            if ext_ip:
+                log(f"  UPnP: Port {port} forwarded successfully")
+                return ext_ip
+            else:
+                log("  UPnP: Port forwarded but could not determine external IP")
+                return None
+        else:
+            log(f"  UPnP: Port forwarding failed — {result.stderr.strip() or result.stdout.strip()}")
+            return None
+    except Exception as e:
+        log(f"  UPnP: Failed ({e})")
+        return None
+
+def remove_upnp_forward(port):
+    """Remove UPnP port mapping on shutdown."""
+    try:
+        subprocess.run(
+            ["upnpc", "-d", str(port), "TCP"],
+            capture_output=True, timeout=10
+        )
+        log("UPnP port mapping removed.")
+    except Exception:
+        pass
+
+def try_ssh_tunnel(port):
+    """Start a reverse SSH tunnel via localhost.run (free, no signup).
+    Falls back to serveo.net. Returns public URL or None."""
+    global tunnel_process
+
+    services = [
+        {
+            "name": "localhost.run",
+            "cmd": [
+                "ssh", "-o", "StrictHostKeyChecking=no",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
+                "-R", f"80:localhost:{port}",
+                "nokey@localhost.run"
+            ],
+            "pattern": r'(https?://[a-z0-9]+\.lhr\.life[^\s]*|https?://[a-z0-9]+\.localhost\.run[^\s]*)',
+        },
+        {
+            "name": "serveo.net",
+            "cmd": [
+                "ssh", "-o", "StrictHostKeyChecking=no",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
+                "-R", f"80:localhost:{port}",
+                "serveo.net"
+            ],
+            "pattern": r'(https?://[a-z0-9]+\.serveo\.net[^\s]*)',
+        },
+    ]
+
+    for svc in services:
+        log(f"  Tunnel: Trying {svc['name']}...")
+        try:
+            proc = subprocess.Popen(
+                svc["cmd"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            # Wait up to 30 seconds for the public URL to appear
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                line = ""
+                # Non-blocking-ish read with a short timeout
+                import select
+                ready, _, _ = select.select([proc.stdout], [], [], 2.0)
+                if ready:
+                    line = proc.stdout.readline()
+                if proc.poll() is not None:
+                    break
+                if line:
+                    match = re.search(svc["pattern"], line)
+                    if match:
+                        url = match.group(1)
+                        tunnel_process = proc
+                        log(f"  Tunnel: Connected via {svc['name']}")
+                        return url
+
+            # Didn't get a URL, kill and try next
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            log(f"  Tunnel: {svc['name']} did not return a URL")
+        except FileNotFoundError:
+            log("  Tunnel: 'ssh' not found — cannot create tunnel")
+            return None
+        except Exception as e:
+            log(f"  Tunnel: {svc['name']} failed ({e})")
+            continue
+
+    return None
+
+def setup_public_access(port):
+    """Try to make the stream publicly accessible from the internet.
+    Tries UPnP first, then SSH tunnel. Returns (url, method) or (None, None)."""
+    global public_url
+
+    if TUNNEL_MODE == "none":
+        log("Public access disabled (TUNNEL_MODE=none)")
+        return None, None
+
+    log("Setting up public internet access...")
+
+    # Method 1: UPnP port forwarding (direct, best performance)
+    if TUNNEL_MODE in ("auto", "upnp"):
+        ext_ip = try_upnp_forward(port)
+        if ext_ip:
+            url = f"http://{ext_ip}:{port}"
+            public_url = url
+            return url, "upnp"
+        if TUNNEL_MODE == "upnp":
+            log_err("UPnP was requested but failed.")
+            return None, None
+
+    # Method 2: SSH reverse tunnel (works behind any NAT/firewall)
+    if TUNNEL_MODE in ("auto", "ssh"):
+        url = try_ssh_tunnel(port)
+        if url:
+            public_url = url
+            return url, "ssh-tunnel"
+        if TUNNEL_MODE == "ssh":
+            log_err("SSH tunnel was requested but failed.")
+            return None, None
+
+    log("  Could not establish public access (stream is still available on LAN)")
+    return None, None
+
+def stop_tunnel():
+    """Clean up tunnel/UPnP on shutdown."""
+    global tunnel_process
+    if tunnel_process:
+        tunnel_process.terminate()
+        try:
+            tunnel_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            tunnel_process.kill()
+        tunnel_process = None
+    remove_upnp_forward(STREAM_PORT)
+
+# ---------------------------------------------------------------------------
+# 5. MJPEG Streaming Server
 # ---------------------------------------------------------------------------
 class MJPEGCaptureThread(threading.Thread):
     """Captures frames from the webcam using ffmpeg and stores the latest JPEG."""
@@ -397,6 +586,7 @@ class StreamHandler(BaseHTTPRequestHandler):
                 "resolution": RESOLUTION,
                 "framerate": FRAMERATE,
                 "streaming": capture_thread.is_alive(),
+                "public_url": public_url,
             })
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -415,7 +605,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 # ---------------------------------------------------------------------------
-# 5. Main
+# 6. Main
 # ---------------------------------------------------------------------------
 def main():
     global capture_thread
@@ -450,18 +640,33 @@ def main():
     def shutdown(signum, frame):
         log("Shutting down...")
         capture_thread.stop()
+        stop_tunnel()
         server.shutdown()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    # Step 6: Set up public internet access
+    pub_url, method = setup_public_access(STREAM_PORT)
+
     log("")
-    log(f"Stream available at:")
-    log(f"  Local:   http://127.0.0.1:{STREAM_PORT}")
-    log(f"  Network: http://{ip}:{STREAM_PORT}")
-    log(f"  Snapshot: http://{ip}:{STREAM_PORT}/snapshot")
-    log(f"  Status:   http://{ip}:{STREAM_PORT}/status")
+    log("=" * 50)
+    log("  Stream is LIVE")
+    log("=" * 50)
+    log(f"  Local:    http://127.0.0.1:{STREAM_PORT}")
+    log(f"  LAN:      http://{ip}:{STREAM_PORT}")
+    if pub_url:
+        log(f"  PUBLIC:   {pub_url}  ({method})")
+        log(f"")
+        log(f"  Share this link with anyone — no same-WiFi needed!")
+    else:
+        log(f"  PUBLIC:   Not available (see logs above)")
+        log(f"")
+        log(f"  Tip: Install 'miniupnpc' for UPnP, or 'openssh-client' for SSH tunnel")
+    log(f"")
+    log(f"  Snapshot: http://127.0.0.1:{STREAM_PORT}/snapshot")
+    log(f"  Status:   http://127.0.0.1:{STREAM_PORT}/status")
     log("")
     log("Press Ctrl+C to stop.")
 

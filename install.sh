@@ -16,7 +16,7 @@ fi
 # Install dependencies
 echo "[1/4] Installing dependencies..."
 apt-get update -qq
-apt-get install -y -qq ffmpeg v4l-utils python3 curl git > /dev/null
+apt-get install -y -qq ffmpeg v4l-utils python3 curl git openssh-client miniupnpc > /dev/null
 
 # Make main script executable
 chmod +x "$SCRIPT_DIR/webcam-stream.py"
